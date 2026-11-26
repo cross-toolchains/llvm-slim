@@ -172,21 +172,6 @@ jobs:
           $extraArgs = @(
             "-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON"
           )
-          $clangCl = Get-Command clang-cl -ErrorAction SilentlyContinue
-          $lldLink = Get-Command lld-link -ErrorAction SilentlyContinue
-          if ($clangCl -and $lldLink) {
-            Write-Host "Using clang-cl ($($clangCl.Source)) + lld-link ($($lldLink.Source))"
-            $extraArgs += @(
-              "-DCMAKE_C_COMPILER=clang-cl",
-              "-DCMAKE_CXX_COMPILER=clang-cl",
-              "-DCMAKE_C_COMPILER_TARGET=${{ matrix.target }}",
-              "-DCMAKE_CXX_COMPILER_TARGET=${{ matrix.target }}",
-              "-DCMAKE_LINKER=lld-link",
-              "-DLLVM_USE_LINKER=lld"
-            )
-          } else {
-            Write-Host "clang-cl/lld-link not found; falling back to MSVC cl.exe with PCH disabled"
-          }
 
           cmake -G Ninja `
             -S "$src" `
