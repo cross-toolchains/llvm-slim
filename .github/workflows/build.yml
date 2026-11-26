@@ -75,6 +75,12 @@ jobs:
             os: windows-latest
             archive: zip
             driver: "OFF"
+            msvc_arch: x64
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            archive: zip
+            driver: "OFF"
+            msvc_arch: arm64
     env:
       LLVM_VERSION: ${{ needs.resolve-version.outputs.version }}
       RELEASE_TAG: ${{ needs.resolve-version.outputs.tag }}
@@ -95,6 +101,8 @@ jobs:
       - name: Setup MSVC environment (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
 
       - name: Download upstream LLVM source tarball
         shell: bash

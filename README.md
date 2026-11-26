@@ -35,6 +35,7 @@ Each `llvm-slim-<version>-<target>` archive contains only the stripped runtime t
 | `aarch64-apple-darwin` | `llvm-slim-<ver>-aarch64-apple-darwin.tar.xz` |
 | `x86_64-apple-darwin` | `llvm-slim-<ver>-x86_64-apple-darwin.tar.xz` |
 | `x86_64-pc-windows-msvc` | `llvm-slim-<ver>-x86_64-pc-windows-msvc.zip` |
+| `aarch64-pc-windows-msvc` | `llvm-slim-<ver>-aarch64-pc-windows-msvc.zip` |
 
 ## Usage
 
