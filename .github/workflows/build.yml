@@ -61,8 +61,8 @@ jobs:
               {"target": "aarch64-unknown-linux-gnu", "os": "ubuntu-24.04-arm", "archive": "tar.xz", "driver": "ON"},
               {"target": "aarch64-apple-darwin", "os": "macos-latest", "archive": "tar.xz", "driver": "ON", "osx_arch": "arm64"},
               {"target": "x86_64-apple-darwin", "os": "macos-15-intel", "archive": "tar.xz", "driver": "ON", "osx_arch": "x86_64"},
-              {"target": "x86_64-pc-windows-msvc", "os": "windows-latest", "archive": "zip", "driver": "OFF", "msvc_arch": "x64"},
-              {"target": "aarch64-pc-windows-msvc", "os": "windows-11-arm", "archive": "zip", "driver": "OFF", "msvc_arch": "arm64"},
+              {"target": "x86_64-pc-windows-msvc", "os": "windows-latest", "archive": "zip", "driver": "ON", "msvc_arch": "x64"},
+              {"target": "aarch64-pc-windows-msvc", "os": "windows-11-arm", "archive": "zip", "driver": "ON", "msvc_arch": "arm64"},
           ]
           flt = [f.strip() for f in os.environ.get("TARGET_FILTER", "").split(",") if f.strip()]
           if flt:
@@ -168,6 +168,9 @@ jobs:
           $build = Join-Path $env:RUNNER_TEMP "build"
           $install = Join-Path $env:RUNNER_TEMP "install"
           $components = "clang;lld;llvm-ar;llvm-objcopy;llvm-ranlib;llvm-strip;llvm-nm;llvm-lib;llvm-dlltool;llvm-rc;clang-resource-headers"
+          if ("${{ matrix.driver }}" -eq "ON") {
+            $components = "llvm-driver;$components"
+          }
 
           $extraArgs = @(
             "-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON"
@@ -180,6 +183,7 @@ jobs:
             "-DCMAKE_INSTALL_PREFIX=$install" `
             "-DLLVM_ENABLE_PROJECTS=clang;lld" `
             "-DLLVM_TARGETS_TO_BUILD=X86;AArch64;ARM;RISCV;WebAssembly" `
+            "-DLLVM_TOOL_LLVM_DRIVER_BUILD=${{ matrix.driver }}" `
             "-DLLVM_DISTRIBUTION_COMPONENTS=$components" `
             -DLLVM_INCLUDE_TESTS=OFF `
             -DLLVM_INCLUDE_EXAMPLES=OFF `
@@ -199,11 +203,102 @@ jobs:
           cmake --build "$build" --target install-distribution
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Deduplicate Windows binaries with Win32 trampoline stubs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $binDir = Join-Path $env:RUNNER_TEMP "install\bin"
+          $stubDir = Join-Path $env:RUNNER_TEMP "stub"
+          New-Item -ItemType Directory -Force -Path $stubDir | Out-Null
+
+          $beforeMb = ((Get-ChildItem $binDir -Filter *.exe | Measure-Object Length -Sum).Sum / 1MB)
+          Write-Host ("Before dedup: {0:N1} MiB" -f $beforeMb)
+
+          $stubSrc = @'
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+
+          int wmain(void) {
+              wchar_t modPath[32768];
+              DWORD len = GetModuleFileNameW(NULL, modPath, 32768);
+              if (len == 0 || len >= 32768) return 127;
+
+              wchar_t *slash = modPath + len;
+              while (slash > modPath && *slash != L'\\' && *slash != L'/') slash--;
+              if (*slash == L'\\' || *slash == L'/') slash++;
+
+              const wchar_t *target = TARGET_EXE;
+              while (*target) *slash++ = *target++;
+              *slash = L'\0';
+
+              const wchar_t *origCmd = GetCommandLineW();
+              size_t cmdLen = lstrlenW(origCmd) + 1;
+              wchar_t *cmdBuf = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, cmdLen * sizeof(wchar_t));
+              if (!cmdBuf) return 127;
+              CopyMemory(cmdBuf, origCmd, cmdLen * sizeof(wchar_t));
+
+              STARTUPINFOW si;
+              PROCESS_INFORMATION pi;
+              ZeroMemory(&si, sizeof(si));
+              si.cb = sizeof(si);
+              ZeroMemory(&pi, sizeof(pi));
+
+              if (!CreateProcessW(modPath, cmdBuf, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+                  HeapFree(GetProcessHeap(), 0, cmdBuf);
+                  return 127;
+              }
+
+              WaitForSingleObject(pi.hProcess, INFINITE);
+              DWORD exitCode = 1;
+              GetExitCodeProcess(pi.hProcess, &exitCode);
+              CloseHandle(pi.hThread);
+              CloseHandle(pi.hProcess);
+              HeapFree(GetProcessHeap(), 0, cmdBuf);
+              return (int)exitCode;
+          }
+          '@
+          $stubC = Join-Path $stubDir "trampoline.c"
+          Set-Content -Path $stubC -Value $stubSrc -Encoding ascii
+
+          $groups = Get-ChildItem $binDir -Filter *.exe |
+            ForEach-Object { [PSCustomObject]@{ File = $_; Hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash } } |
+            Group-Object Hash
+
+          foreach ($g in $groups) {
+            if ($g.Count -le 1) { continue }
+            $files = $g.Group.File
+            $canonical = $files | Where-Object { $_.Name -ieq "llvm.exe" } | Select-Object -First 1
+            if (-not $canonical) { $canonical = $files | Where-Object { $_.Name -ieq "clang.exe" } | Select-Object -First 1 }
+            if (-not $canonical) { $canonical = $files | Where-Object { $_.Name -ieq "lld.exe" } | Select-Object -First 1 }
+            if (-not $canonical) { $canonical = $files | Sort-Object { $_.Name.Length } | Select-Object -First 1 }
+
+            $stubWrapperC = Join-Path $stubDir ("stub-" + $canonical.BaseName + ".c")
+            Set-Content -Path $stubWrapperC -Value "#define TARGET_EXE L`"$($canonical.Name)`"`n#include `"trampoline.c`"" -Encoding ascii
+            $stubExe = Join-Path $stubDir ("stub-" + $canonical.BaseName + ".exe")
+            $stubObj = Join-Path $stubDir ("stub-" + $canonical.BaseName + ".obj")
+            & cl.exe /nologo /O1 /Os /MD /W3 "/I$stubDir" "/Fo$stubObj" "$stubWrapperC" /link /OPT:REF /OPT:ICF "/OUT:$stubExe"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+            foreach ($f in $files) {
+              if ($f.FullName -eq $canonical.FullName) { continue }
+              Write-Host "Replacing duplicate $($f.Name) -> stub -> $($canonical.Name)"
+              Copy-Item $stubExe $f.FullName -Force
+            }
+          }
+
+          $afterMb = ((Get-ChildItem $binDir -Filter *.exe | Measure-Object Length -Sum).Sum / 1MB)
+          Write-Host ("After dedup:  {0:N1} MiB" -f $afterMb)
+          Get-ChildItem $binDir -Filter *.exe | Format-Table Name, @{n='KB';e={[math]::Round($_.Length/1KB, 1)}} -AutoSize
+
       - name: Smoke-test installed clang & lld
         shell: bash
         run: |
           "$RUNNER_TEMP/install/bin/clang" --version
+          "$RUNNER_TEMP/install/bin/clang++" --version
           "$RUNNER_TEMP/install/bin/ld.lld" --version || "$RUNNER_TEMP/install/bin/lld" --version
+          "$RUNNER_TEMP/install/bin/llvm-ar" --version
+          "$RUNNER_TEMP/install/bin/llvm-strip" --version
 
       - name: Package archive (tar.xz)
         if: matrix.archive == 'tar.xz'
@@ -224,12 +319,21 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $name = "llvm-slim-$env:LLVM_VERSION-${{ matrix.target }}"
           $staged = Join-Path $env:RUNNER_TEMP $name
           Move-Item (Join-Path $env:RUNNER_TEMP "install") $staged
-          $archive = Join-Path "dist" "$name.zip"
-          Compress-Archive -Path $staged -DestinationPath $archive -Force
+          $archive = Join-Path (Resolve-Path "dist").Path "$name.zip"
+          $sevenZip = Get-Command 7z -ErrorAction SilentlyContinue
+          if ($sevenZip) {
+            Push-Location $env:RUNNER_TEMP
+            & 7z a -tzip -mx=9 "$archive" "$name"
+            Pop-Location
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Compress-Archive -Path $staged -DestinationPath $archive -Force
+          }
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii -NoNewline "$archive.sha256"
           Get-ChildItem dist
