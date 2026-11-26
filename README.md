@@ -1,6 +1,12 @@
 <div align="center">
 
-# llvm-slim
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/simple-icons/llvm.svg?color=%23ffffff" />
+  <source media="(prefers-color-scheme: light)" srcset="https://api.iconify.design/simple-icons/llvm.svg?color=%23000000" />
+  <img src="https://api.iconify.design/simple-icons/llvm.svg?color=%23000000" height="56" alt="LLVM" />
+</picture>
+
+<h1>llvm-slim</h1>
 
 **Minimal, portable, multi-target LLVM (`clang` + `lld` + binutils) prebuilt binaries for Linux, macOS, and Windows.**
 
