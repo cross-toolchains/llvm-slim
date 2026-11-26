@@ -1,0 +1,53 @@
+name: Check Upstream LLVM
+
+on:
+  schedule:
+    # Check daily at 06:00 UTC for new stable upstream LLVM releases
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check latest stable LLVM release and trigger build if missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Fetch latest non-prerelease, non-draft stable tag matching `llvmorg-X.Y.Z`
+          # (strictly skips `-rc`, `-init`, betas, etc.).
+          TAG="$(gh api repos/llvm/llvm-project/releases?per_page=20 \
+            --jq '[.[] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^llvmorg-[0-9]+\\.[0-9]+\\.[0-9]+$"))] | first // empty')"
+
+          if [ -z "$TAG" ]; then
+            echo "No matching stable llvmorg-X.Y.Z release found."
+            exit 0
+          fi
+
+          VERSION="${TAG#llvmorg-}"
+          SLIM_TAG="llvm-${VERSION}"
+          echo "Latest stable upstream LLVM: ${VERSION} (${TAG})"
+
+          if gh release view "$SLIM_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${SLIM_TAG} already exists; nothing to do."
+            exit 0
+          fi
+
+          SRC_URL="https://github.com/llvm/llvm-project/releases/download/${TAG}/llvm-project-${VERSION}.src.tar.xz"
+          if ! curl -fsSI "$SRC_URL" >/dev/null 2>&1; then
+            echo "Source tarball not yet uploaded at ${SRC_URL}; will retry on next schedule."
+            exit 0
+          fi
+
+          echo "Triggering build.yml for LLVM ${VERSION}..."
+          gh workflow run build.yml \
+            --repo "${{ github.repository }}" \
+            -f llvm_version="${VERSION}" \
+            -f publish_release=true
