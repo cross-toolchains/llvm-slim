@@ -1,0 +1,223 @@
+name: Build llvm-slim
+
+on:
+  push:
+    tags:
+      - "llvm-*"
+  workflow_dispatch:
+    inputs:
+      llvm_version:
+        description: "Upstream LLVM version (e.g. 23.1.6)"
+        required: true
+        default: "23.1.6"
+        type: string
+      publish_release:
+        description: "Create/update GitHub Release llvm-<version> with built archives"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      publish: ${{ steps.ver.outputs.publish }}
+    steps:
+      - id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            VER="${TAG#llvm-}"
+            PUB="true"
+          else
+            VER="${{ inputs.llvm_version }}"
+            TAG="llvm-${VER}"
+            PUB="${{ inputs.publish_release }}"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUB" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: resolve-version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: tar.xz
+            driver: "ON"
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.xz
+            driver: "ON"
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.xz
+            driver: "ON"
+            osx_arch: arm64
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive: tar.xz
+            driver: "ON"
+            osx_arch: x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            driver: "OFF"
+    env:
+      LLVM_VERSION: ${{ needs.resolve-version.outputs.version }}
+      RELEASE_TAG: ${{ needs.resolve-version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang lld xz-utils python3
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake ninja
+
+      - name: Setup MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Download upstream LLVM source tarball
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/src"
+          curl -fsSL \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz" \
+            -o "$RUNNER_TEMP/llvm-src.tar.xz"
+          tar -xf "$RUNNER_TEMP/llvm-src.tar.xz" -C "$RUNNER_TEMP/src" --strip-components=1
+          rm -f "$RUNNER_TEMP/llvm-src.tar.xz"
+
+      - name: Configure & build slim LLVM (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          COMPONENTS="clang;lld;llvm-ar;llvm-objcopy;llvm-ranlib;llvm-strip;llvm-nm;llvm-lib;llvm-dlltool;llvm-rc;clang-resource-headers"
+          if [ "${{ matrix.driver }}" = "ON" ]; then
+            COMPONENTS="llvm-driver;${COMPONENTS}"
+          fi
+          EXTRA_ARGS=()
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            EXTRA_ARGS+=(-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_USE_LINKER=lld)
+          elif [ "${{ runner.os }}" = "macOS" ] && [ -n "${{ matrix.osx_arch }}" ]; then
+            EXTRA_ARGS+=(-DCMAKE_OSX_ARCHITECTURES="${{ matrix.osx_arch }}" -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0)
+          fi
+
+          cmake -G Ninja \
+            -S "$RUNNER_TEMP/src/llvm" \
+            -B "$RUNNER_TEMP/build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/install" \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM;RISCV;WebAssembly" \
+            -DLLVM_TOOL_LLVM_DRIVER_BUILD="${{ matrix.driver }}" \
+            -DLLVM_DISTRIBUTION_COMPONENTS="$COMPONENTS" \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_ENABLE_BINDINGS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLANG_INCLUDE_DOCS=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF \
+            "${EXTRA_ARGS[@]}"
+
+          cmake --build "$RUNNER_TEMP/build" --target distribution
+          cmake --build "$RUNNER_TEMP/build" --target install-distribution-stripped
+
+      - name: Configure & build slim LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP "src/llvm"
+          $build = Join-Path $env:RUNNER_TEMP "build"
+          $install = Join-Path $env:RUNNER_TEMP "install"
+          $components = "clang;lld;llvm-ar;llvm-objcopy;llvm-ranlib;llvm-strip;llvm-nm;llvm-lib;llvm-dlltool;llvm-rc;clang-resource-headers"
+
+          cmake -G Ninja `
+            -S $src `
+            -B $build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX=$install `
+            -DLLVM_ENABLE_PROJECTS="clang;lld" `
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM;RISCV;WebAssembly" `
+            -DLLVM_DISTRIBUTION_COMPONENTS="$components" `
+            -DLLVM_INCLUDE_TESTS=OFF `
+            -DLLVM_INCLUDE_EXAMPLES=OFF `
+            -DLLVM_INCLUDE_BENCHMARKS=OFF `
+            -DLLVM_INCLUDE_DOCS=OFF `
+            -DLLVM_ENABLE_BINDINGS=OFF `
+            -DCLANG_INCLUDE_TESTS=OFF `
+            -DCLANG_INCLUDE_DOCS=OFF `
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF `
+            -DCLANG_ENABLE_ARCMT=OFF
+
+          cmake --build $build --target distribution
+          cmake --build $build --target install-distribution
+
+      - name: Smoke-test installed clang & lld
+        shell: bash
+        run: |
+          "$RUNNER_TEMP/install/bin/clang" --version
+          "$RUNNER_TEMP/install/bin/ld.lld" --version || "$RUNNER_TEMP/install/bin/lld" --version
+
+      - name: Package archive (tar.xz)
+        if: matrix.archive == 'tar.xz'
+        shell: bash
+        run: |
+          mkdir -p dist
+          NAME="llvm-slim-${LLVM_VERSION}-${{ matrix.target }}"
+          mv "$RUNNER_TEMP/install" "$RUNNER_TEMP/$NAME"
+          tar -cJf "dist/${NAME}.tar.xz" -C "$RUNNER_TEMP" "$NAME"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${NAME}.tar.xz" > "${NAME}.tar.xz.sha256")
+          else
+            (cd dist && shasum -a 256 "${NAME}.tar.xz" > "${NAME}.tar.xz.sha256")
+          fi
+          ls -lh dist
+
+      - name: Package archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $name = "llvm-slim-$env:LLVM_VERSION-${{ matrix.target }}"
+          $staged = Join-Path $env:RUNNER_TEMP $name
+          Move-Item (Join-Path $env:RUNNER_TEMP "install") $staged
+          $archive = Join-Path "dist" "$name.zip"
+          Compress-Archive -Path $staged -DestinationPath $archive -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii -NoNewline "$archive.sha256"
+          Get-ChildItem dist
+
+      - name: Upload to GitHub Release
+        if: needs.resolve-version.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --title "LLVM ${LLVM_VERSION} (slim)" \
+              --notes "Minimal portable LLVM ${LLVM_VERSION} (\`clang\` + \`lld\` + binutils) built from \`llvmorg-${LLVM_VERSION}\`." || true
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
