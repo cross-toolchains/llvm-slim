@@ -16,6 +16,11 @@ on:
         required: false
         default: true
         type: boolean
+      target_filter:
+        description: "Optional comma-separated target substring filter (e.g. windows, aarch64-pc-windows-msvc). Empty builds all 6 targets."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -27,14 +32,18 @@ jobs:
       version: ${{ steps.ver.outputs.version }}
       tag: ${{ steps.ver.outputs.tag }}
       publish: ${{ steps.ver.outputs.publish }}
+      matrix: ${{ steps.ver.outputs.matrix }}
     steps:
       - id: ver
         shell: bash
+        env:
+          TARGET_FILTER: ${{ inputs.target_filter }}
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
             TAG="${GITHUB_REF_NAME}"
             VER="${TAG#llvm-}"
             PUB="true"
+            TARGET_FILTER=""
           else
             VER="${{ inputs.llvm_version }}"
             TAG="llvm-${VER}"
@@ -44,6 +53,29 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "publish=$PUB" >> "$GITHUB_OUTPUT"
 
+          MATRIX=$(python3 - <<'PY'
+          import json, os
+
+          all_targets = [
+              {"target": "x86_64-unknown-linux-gnu", "os": "ubuntu-22.04", "archive": "tar.xz", "driver": "ON"},
+              {"target": "aarch64-unknown-linux-gnu", "os": "ubuntu-24.04-arm", "archive": "tar.xz", "driver": "ON"},
+              {"target": "aarch64-apple-darwin", "os": "macos-latest", "archive": "tar.xz", "driver": "ON", "osx_arch": "arm64"},
+              {"target": "x86_64-apple-darwin", "os": "macos-15-intel", "archive": "tar.xz", "driver": "ON", "osx_arch": "x86_64"},
+              {"target": "x86_64-pc-windows-msvc", "os": "windows-latest", "archive": "zip", "driver": "OFF", "msvc_arch": "x64"},
+              {"target": "aarch64-pc-windows-msvc", "os": "windows-11-arm", "archive": "zip", "driver": "OFF", "msvc_arch": "arm64"},
+          ]
+          flt = [f.strip() for f in os.environ.get("TARGET_FILTER", "").split(",") if f.strip()]
+          if flt:
+              selected = [t for t in all_targets if any(f in t["target"] for f in flt)]
+          else:
+              selected = all_targets
+          if not selected:
+              raise SystemExit(f"No targets matched target_filter={flt!r}")
+          print(json.dumps({"include": selected}, separators=(",", ":")))
+          PY
+          )
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.target }})
     needs: resolve-version
@@ -51,36 +83,7 @@ jobs:
     timeout-minutes: 180
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-            archive: tar.xz
-            driver: "ON"
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            archive: tar.xz
-            driver: "ON"
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            archive: tar.xz
-            driver: "ON"
-            osx_arch: arm64
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
-            archive: tar.xz
-            driver: "ON"
-            osx_arch: x86_64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
-            driver: "OFF"
-            msvc_arch: x64
-          - target: aarch64-pc-windows-msvc
-            os: windows-11-arm
-            archive: zip
-            driver: "OFF"
-            msvc_arch: arm64
+      matrix: ${{ fromJson(needs.resolve-version.outputs.matrix) }}
     env:
       LLVM_VERSION: ${{ needs.resolve-version.outputs.version }}
       RELEASE_TAG: ${{ needs.resolve-version.outputs.tag }}
@@ -160,19 +163,39 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $src = Join-Path $env:RUNNER_TEMP "src/llvm"
+          $ErrorActionPreference = "Stop"
+          $src = Join-Path $env:RUNNER_TEMP "src\llvm"
           $build = Join-Path $env:RUNNER_TEMP "build"
           $install = Join-Path $env:RUNNER_TEMP "install"
           $components = "clang;lld;llvm-ar;llvm-objcopy;llvm-ranlib;llvm-strip;llvm-nm;llvm-lib;llvm-dlltool;llvm-rc;clang-resource-headers"
 
+          $extraArgs = @(
+            "-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON"
+          )
+          $clangCl = Get-Command clang-cl -ErrorAction SilentlyContinue
+          $lldLink = Get-Command lld-link -ErrorAction SilentlyContinue
+          if ($clangCl -and $lldLink) {
+            Write-Host "Using clang-cl ($($clangCl.Source)) + lld-link ($($lldLink.Source))"
+            $extraArgs += @(
+              "-DCMAKE_C_COMPILER=clang-cl",
+              "-DCMAKE_CXX_COMPILER=clang-cl",
+              "-DCMAKE_C_COMPILER_TARGET=${{ matrix.target }}",
+              "-DCMAKE_CXX_COMPILER_TARGET=${{ matrix.target }}",
+              "-DCMAKE_LINKER=lld-link",
+              "-DLLVM_USE_LINKER=lld"
+            )
+          } else {
+            Write-Host "clang-cl/lld-link not found; falling back to MSVC cl.exe with PCH disabled"
+          }
+
           cmake -G Ninja `
-            -S $src `
-            -B $build `
+            -S "$src" `
+            -B "$build" `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_INSTALL_PREFIX=$install `
-            -DLLVM_ENABLE_PROJECTS="clang;lld" `
-            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM;RISCV;WebAssembly" `
-            -DLLVM_DISTRIBUTION_COMPONENTS="$components" `
+            "-DCMAKE_INSTALL_PREFIX=$install" `
+            "-DLLVM_ENABLE_PROJECTS=clang;lld" `
+            "-DLLVM_TARGETS_TO_BUILD=X86;AArch64;ARM;RISCV;WebAssembly" `
+            "-DLLVM_DISTRIBUTION_COMPONENTS=$components" `
             -DLLVM_INCLUDE_TESTS=OFF `
             -DLLVM_INCLUDE_EXAMPLES=OFF `
             -DLLVM_INCLUDE_BENCHMARKS=OFF `
@@ -181,10 +204,15 @@ jobs:
             -DCLANG_INCLUDE_TESTS=OFF `
             -DCLANG_INCLUDE_DOCS=OFF `
             -DCLANG_ENABLE_STATIC_ANALYZER=OFF `
-            -DCLANG_ENABLE_ARCMT=OFF
+            -DCLANG_ENABLE_ARCMT=OFF `
+            @extraArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          cmake --build $build --target distribution
-          cmake --build $build --target install-distribution
+          cmake --build "$build" --target distribution
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cmake --build "$build" --target install-distribution
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Smoke-test installed clang & lld
         shell: bash
