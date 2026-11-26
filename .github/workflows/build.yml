@@ -111,7 +111,11 @@ jobs:
           curl -fsSL \
             "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz" \
             -o "$RUNNER_TEMP/llvm-src.tar.xz"
-          tar -xf "$RUNNER_TEMP/llvm-src.tar.xz" -C "$RUNNER_TEMP/src" --strip-components=1
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            /c/Windows/System32/tar.exe -xf "$RUNNER_TEMP/llvm-src.tar.xz" -C "$RUNNER_TEMP/src" --strip-components=1
+          else
+            tar -xf "$RUNNER_TEMP/llvm-src.tar.xz" -C "$RUNNER_TEMP/src" --strip-components=1
+          fi
           rm -f "$RUNNER_TEMP/llvm-src.tar.xz"
 
       - name: Configure & build slim LLVM (Unix)
